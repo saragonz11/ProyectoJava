@@ -3,78 +3,141 @@ package com.FactuaracionPrimeraEntregaGonzalez.Makeup.service;
 import com.FactuaracionPrimeraEntregaGonzalez.Makeup.domain.*;
 import com.FactuaracionPrimeraEntregaGonzalez.Makeup.dto.venta.*;
 import com.FactuaracionPrimeraEntregaGonzalez.Makeup.repository.*;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.*;
 
-@Service @RequiredArgsConstructor
+@Data
+class WorldClockResponse {
+    private String currentDateTime;
+}
+
+@Service
+@RequiredArgsConstructor
 @Transactional
 public class VentaService {
+
     private final VentaRepository ventaRepo;
     private final ClienteRepository clienteRepo;
     private final ProductoRepository productoRepo;
 
-    public VentaResponse create(VentaCreateRequest r){
-        var cliente = clienteRepo.findById(r.getClienteId())
+    private LocalDateTime obtenerFechaComprobanteUtc() {
+        try {
+            RestTemplate restTemplate = new RestTemplate();
+            String url = "http://worldclockapi.com/api/json/utc/now";
+            ResponseEntity<WorldClockResponse> resp =
+                    restTemplate.getForEntity(url, WorldClockResponse.class);
+
+            WorldClockResponse body = resp.getBody();
+            if (resp.getStatusCode().is2xxSuccessful()
+                    && body != null
+                    && body.getCurrentDateTime() != null) {
+
+                return OffsetDateTime.parse(body.getCurrentDateTime())
+                        .toLocalDateTime();
+            }
+        } catch (Exception ex) {
+        }
+
+        return LocalDateTime.now(ZoneOffset.UTC);
+    }
+
+    public VentaResponse create(VentaCreateRequest r) {
+        Long clienteId = r.getCliente().getClienteId();
+
+        Cliente cliente = clienteRepo.findById(clienteId)
                 .orElseThrow(() -> new NoSuchElementException("Cliente no encontrado"));
 
-        var venta = new Venta();
+        Venta venta = new Venta();
         venta.setCliente(cliente);
-        venta.setFecha(LocalDateTime.now());
 
-        var items = new ArrayList<VentaItem>();
-        for (var it : r.getItems()) {
-            var p = productoRepo.findById(it.getProductoId())
-                    .orElseThrow(() -> new NoSuchElementException("Producto no encontrado: " + it.getProductoId()));
-            if (Boolean.FALSE.equals(p.getActivo())) throw new IllegalArgumentException("Producto inactivo: " + p.getSku());
-            if (p.getStock() < it.getCantidad()) throw new IllegalStateException("Stock insuficiente para " + p.getSku());
-            p.setStock(p.getStock() - it.getCantidad());
+        venta.setFecha(obtenerFechaComprobanteUtc());
 
-            var vi = new VentaItem();
+        List<VentaItem> items = new ArrayList<>();
+
+        for (VentaLineaCreate linea : r.getLineas()) {
+            Long productoId = linea.getProducto().getProductoId();
+
+            Producto p = productoRepo.findById(productoId)
+                    .orElseThrow(() -> new NoSuchElementException("Producto no encontrado: " + productoId));
+
+            if (Boolean.FALSE.equals(p.getActivo())) {
+                throw new IllegalArgumentException("Producto inactivo: " + p.getSku());
+            }
+
+            if (p.getStock() < linea.getCantidad()) {
+                throw new IllegalStateException("Stock insuficiente para " + p.getSku());
+            }
+
+            p.setStock(p.getStock() - linea.getCantidad());
+
+            VentaItem vi = new VentaItem();
             vi.setProducto(p);
-            vi.setCantidad(it.getCantidad());
-            vi.setPrecioUnitario(p.getPrecio()); // snapshot
+            vi.setCantidad(linea.getCantidad());
+            vi.setPrecioUnitario(p.getPrecio());
             vi.setVenta(venta);
+
             items.add(vi);
         }
 
         venta.setItems(items);
         venta = ventaRepo.save(venta);
 
-        // total (subtotales ya en @PrePersist)
         BigDecimal total = BigDecimal.ZERO;
-        for (var vi : venta.getItems()) total = total.add(vi.getSubtotal());
+        for (VentaItem vi : venta.getItems()) {
+            total = total.add(vi.getSubtotal());
+        }
         venta.setTotal(total);
 
         return toResp(venta);
     }
 
-    public VentaResponse get(Long id){
-        var v = ventaRepo.findById(id).orElseThrow(() -> new NoSuchElementException("Venta no encontrada"));
+    public VentaResponse get(Long id) {
+        Venta v = ventaRepo.findById(id)
+                .orElseThrow(() -> new NoSuchElementException("Venta no encontrada"));
         return toResp(v);
     }
 
-    public List<VentaResponse> list(Long clienteId){
-        var data = (clienteId == null) ? ventaRepo.findAll() : ventaRepo.findByClienteIdOrderByFechaDesc(clienteId);
+    public List<VentaResponse> list(Long clienteId) {
+        List<Venta> data = (clienteId == null)
+                ? ventaRepo.findAll()
+                : ventaRepo.findByClienteIdOrderByFechaDesc(clienteId);
         return data.stream().map(this::toResp).toList();
     }
 
-    private VentaResponse toResp(Venta v){
-        var items = v.getItems().stream().map(it ->
-                new VentaResponse.Item(
+    private VentaResponse toResp(Venta v) {
+        List<VentaResponse.Item> items = v.getItems().stream()
+                .map(it -> new VentaResponse.Item(
                         it.getProducto().getId(),
                         it.getProducto().getSku(),
                         it.getProducto().getNombre(),
                         it.getCantidad(),
                         it.getPrecioUnitario(),
                         it.getSubtotal()
-                )).toList();
+                ))
+                .toList();
 
-        return new VentaResponse(v.getId(), v.getCliente().getId(), v.getCliente().getNombre(),
-                v.getFecha(), v.getTotal(), items);
+        int cantidadTotalProductos = v.getItems().stream()
+                .mapToInt(VentaItem::getCantidad)
+                .sum();
+
+        return new VentaResponse(
+                v.getId(),
+                v.getCliente().getId(),
+                v.getCliente().getNombre(),
+                v.getFecha(),
+                v.getTotal(),
+                cantidadTotalProductos,
+                items
+        );
     }
 }

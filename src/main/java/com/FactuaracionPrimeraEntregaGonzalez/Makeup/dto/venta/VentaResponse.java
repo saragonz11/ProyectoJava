@@ -22,5 +22,6 @@ public class VentaResponse {
     private String clienteNombre;
     private LocalDateTime fecha;
     private BigDecimal total;
+    private Integer cantidadTotalProductos;
     private List<Item> items;
 }
